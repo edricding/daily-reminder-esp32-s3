@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include "driver/i2c.h"
 #include "driver/i2s_std.h"
@@ -88,8 +89,20 @@
 #define BEEP_AMPLITUDE          24000
 #define BEEP_WRITE_TIMEOUT_MS   600
 #define BEEP_WRITE_CHUNK_BYTES  2048
+#define BEEP_BOOT_DURATION_MS   5000
 
 #define DRAW_CHUNK_ROWS      8
+
+#define RING_TEXT                "LOVE WAGAGA LOVE WAGAGA "
+#define RING_SLOT_COUNT          32
+#define RING_RADIUS              150.0f
+#define RING_FONT_SCALE          2
+#define RING_GLYPH_CANVAS_W      28
+#define RING_GLYPH_CANVAS_H      28
+#define RING_GLYPH_STROKE        2
+#define RING_UPDATE_INTERVAL_US  33333
+#define RING_ROTATE_STEP_RAD     0.00349066f  // 0.2 degrees
+#define PI_F                     3.14159265f
 
 // Some ESP32-S3-Touch-LCD-1.85C batches require this init table.
 static const st77916_lcd_init_cmd_t st77916_init_waveshare_185c[] = {
@@ -300,6 +313,7 @@ static bool s_touch_pressed_last = false;
 static int64_t s_last_beep_us = 0;
 
 static void beep_once(void);
+static void beep_for_ms(uint32_t duration_ms);
 
 enum {
     SEG_A = 1 << 0,
@@ -450,16 +464,178 @@ static void draw_digit_value(int x, int y, int digit_w, int digit_h, int seg_w, 
     draw_digit_mask(x, y, digit_w, digit_h, seg_w, s_digit_mask[value], color);
 }
 
-static void draw_time(const struct tm *ti, bool synced)
-{
-    const uint16_t bg = rgb565_be(0, 0, 0);
-    const uint16_t fg = synced ? rgb565_be(0, 220, 90) : rgb565_be(230, 180, 0);
+static const uint8_t s_font_5x7_space[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t s_font_5x7_A[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+static const uint8_t s_font_5x7_E[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
+static const uint8_t s_font_5x7_G[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E};
+static const uint8_t s_font_5x7_L[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
+static const uint8_t s_font_5x7_O[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+static const uint8_t s_font_5x7_V[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04};
+static const uint8_t s_font_5x7_W[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
+static uint16_t s_ring_glyph_canvas[RING_GLYPH_CANVAS_W * RING_GLYPH_CANVAS_H];
 
-    const int digit_w = 42;
-    const int digit_h = 96;
-    const int seg_w = 8;
-    const int colon_w = 8;
-    const int gap = 8;
+static const uint8_t *font_5x7_get_glyph(char c)
+{
+    switch (c) {
+        case 'A':
+            return s_font_5x7_A;
+        case 'E':
+            return s_font_5x7_E;
+        case 'G':
+            return s_font_5x7_G;
+        case 'L':
+            return s_font_5x7_L;
+        case 'O':
+            return s_font_5x7_O;
+        case 'V':
+            return s_font_5x7_V;
+        case 'W':
+            return s_font_5x7_W;
+        case ' ':
+        default:
+            return s_font_5x7_space;
+    }
+}
+
+static void draw_char_5x7_scaled_rotated(int cx, int cy, char c, int scale, float angle_rad, uint16_t fg, uint16_t bg)
+{
+    if (!s_panel) {
+        return;
+    }
+
+    if (scale < 1) {
+        scale = 1;
+    }
+
+    for (size_t i = 0; i < (size_t)RING_GLYPH_CANVAS_W * (size_t)RING_GLYPH_CANVAS_H; i++) {
+        s_ring_glyph_canvas[i] = bg;
+    }
+
+    const uint8_t *glyph = font_5x7_get_glyph(c);
+    const int src_w = 5 * scale;
+    const int src_h = 7 * scale;
+    const float src_cx = ((float)src_w - 1.0f) * 0.5f;
+    const float src_cy = ((float)src_h - 1.0f) * 0.5f;
+    const float dst_cx = ((float)RING_GLYPH_CANVAS_W - 1.0f) * 0.5f;
+    const float dst_cy = ((float)RING_GLYPH_CANVAS_H - 1.0f) * 0.5f;
+    const float cs = cosf(angle_rad);
+    const float sn = sinf(angle_rad);
+
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 5; col++) {
+            if ((bits & (1U << (4 - col))) == 0) {
+                continue;
+            }
+            for (int sy = 0; sy < scale; sy++) {
+                for (int sx = 0; sx < scale; sx++) {
+                    float lx = (float)(col * scale + sx) - src_cx;
+                    float ly = (float)(row * scale + sy) - src_cy;
+                    float rx = lx * cs - ly * sn;
+                    float ry = lx * sn + ly * cs;
+                    int dx = (int)lroundf(rx + dst_cx);
+                    int dy = (int)lroundf(ry + dst_cy);
+                    for (int oy = 0; oy < RING_GLYPH_STROKE; oy++) {
+                        for (int ox = 0; ox < RING_GLYPH_STROKE; ox++) {
+                            int px = dx + ox;
+                            int py = dy + oy;
+                            if (px >= 0 && px < RING_GLYPH_CANVAS_W && py >= 0 && py < RING_GLYPH_CANVAS_H) {
+                                s_ring_glyph_canvas[py * RING_GLYPH_CANVAS_W + px] = fg;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    int x0 = cx - RING_GLYPH_CANVAS_W / 2;
+    int y0 = cy - RING_GLYPH_CANVAS_H / 2;
+    if (x0 < 0 || y0 < 0 || (x0 + RING_GLYPH_CANVAS_W) > LCD_H_RES || (y0 + RING_GLYPH_CANVAS_H) > LCD_V_RES) {
+        return;
+    }
+
+    esp_lcd_panel_draw_bitmap(
+        s_panel,
+        x0,
+        y0,
+        x0 + RING_GLYPH_CANVAS_W,
+        y0 + RING_GLYPH_CANVAS_H,
+        s_ring_glyph_canvas);
+}
+
+static void ring_animation_tick(void)
+{
+    static const char ring_text[] = RING_TEXT;
+    static const int ring_text_len = (int)(sizeof(ring_text) - 1);
+    static bool initialized = false;
+    static float current_angle = 0.0f;
+    const int cx = LCD_H_RES / 2;
+    const int cy = LCD_V_RES / 2;
+    const float angle_step = (2.0f * PI_F) / (float)RING_SLOT_COUNT;
+    const uint16_t bg = rgb565_be(0x00, 0x00, 0x00);
+    const uint16_t ring_color = rgb565_be(0xF7, 0xF3, 0xE8);
+    float previous_angle = current_angle;
+
+    if (!initialized) {
+        for (int i = 0; i < RING_SLOT_COUNT; i++) {
+            char ch = ring_text[i % ring_text_len];
+            float theta = current_angle + (float)i * angle_step;
+            int px = (int)lroundf((float)cx + cosf(theta) * RING_RADIUS);
+            int py = (int)lroundf((float)cy + sinf(theta) * RING_RADIUS);
+            float tangent = theta + (PI_F * 0.5f);
+            draw_char_5x7_scaled_rotated(px, py, ch, RING_FONT_SCALE, tangent, ring_color, bg);
+        }
+        initialized = true;
+        return;
+    }
+
+    previous_angle = current_angle;
+    current_angle += RING_ROTATE_STEP_RAD;
+    if (current_angle >= (2.0f * PI_F)) {
+        current_angle -= (2.0f * PI_F);
+    }
+
+    // Pass 1: clear all old glyph positions.
+    for (int i = 0; i < RING_SLOT_COUNT; i++) {
+        char ch = ring_text[i % ring_text_len];
+
+        float old_theta = previous_angle + (float)i * angle_step;
+        int old_px = (int)lroundf((float)cx + cosf(old_theta) * RING_RADIUS);
+        int old_py = (int)lroundf((float)cy + sinf(old_theta) * RING_RADIUS);
+        float old_tangent = old_theta + (PI_F * 0.5f);
+        draw_char_5x7_scaled_rotated(old_px, old_py, ch, RING_FONT_SCALE, old_tangent, bg, bg);
+    }
+
+    // Pass 2: draw all new glyph positions.
+    for (int i = 0; i < RING_SLOT_COUNT; i++) {
+        char ch = ring_text[i % ring_text_len];
+        float new_theta = current_angle + (float)i * angle_step;
+        int new_px = (int)lroundf((float)cx + cosf(new_theta) * RING_RADIUS);
+        int new_py = (int)lroundf((float)cy + sinf(new_theta) * RING_RADIUS);
+        float new_tangent = new_theta + (PI_F * 0.5f);
+        draw_char_5x7_scaled_rotated(new_px, new_py, ch, RING_FONT_SCALE, new_tangent, ring_color, bg);
+    }
+}
+
+static void draw_time(const struct tm *ti)
+{
+    const uint16_t bg = rgb565_be(0x00, 0x00, 0x00);
+    const uint16_t hour_color = rgb565_be(0xD9, 0x54, 0x75);
+    const uint16_t minute_color = rgb565_be(0xF3, 0x9A, 0x8F);
+    const uint16_t second_color = rgb565_be(0xF2, 0xD3, 0xBF);
+    const uint16_t digit_colors[6] = {
+        hour_color, hour_color,
+        minute_color, minute_color,
+        second_color, second_color
+    };
+    const uint16_t colon_color = rgb565_be(0xF7, 0xF3, 0xE8);
+
+    const int digit_w = 36;
+    const int digit_h = 84;
+    const int seg_w = 7;
+    const int colon_w = 6;
+    const int gap = 6;
 
     int total_w = (6 * digit_w) + (2 * colon_w) + (7 * gap);
     int x0 = (LCD_H_RES - total_w) / 2;
@@ -475,7 +651,6 @@ static void draw_time(const struct tm *ti, bool synced)
     };
 
     static bool initialized = false;
-    static bool last_synced = false;
     static int last_digits[6] = {-1, -1, -1, -1, -1, -1};
 
     int digit_x[6] = {0};
@@ -497,16 +672,15 @@ static void draw_time(const struct tm *ti, bool synced)
         x += gap;
     }
 
-    if (!initialized || synced != last_synced) {
-        lcd_fill_rect(0, y - 20, LCD_H_RES, digit_h + 40, bg);
+    if (!initialized) {
+        lcd_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
         for (int i = 0; i < 6; i++) {
-            draw_digit_value(digit_x[i], y, digit_w, digit_h, seg_w, digits[i], fg);
+            draw_digit_value(digit_x[i], y, digit_w, digit_h, seg_w, digits[i], digit_colors[i]);
             last_digits[i] = digits[i];
         }
-        draw_colon(colon_x[0], y, digit_h, colon_w, fg);
-        draw_colon(colon_x[1], y, digit_h, colon_w, fg);
+        draw_colon(colon_x[0], y, digit_h, colon_w, colon_color);
+        draw_colon(colon_x[1], y, digit_h, colon_w, colon_color);
         initialized = true;
-        last_synced = synced;
         return;
     }
 
@@ -522,7 +696,7 @@ static void draw_time(const struct tm *ti, bool synced)
             draw_digit_mask(digit_x[i], y, digit_w, digit_h, seg_w, turn_off, bg);
         }
         if (turn_on) {
-            draw_digit_mask(digit_x[i], y, digit_w, digit_h, seg_w, turn_on, fg);
+            draw_digit_mask(digit_x[i], y, digit_w, digit_h, seg_w, turn_on, digit_colors[i]);
         }
         last_digits[i] = digits[i];
     }
@@ -592,24 +766,6 @@ static void audio_amp_init_via_exio(void)
     bool sd_level = EXIO_AUDIO_SD_ACTIVE_HIGH ? true : false;
     ESP_ERROR_CHECK(exio_set_pin_level(EXIO_AUDIO_SD_PIN, sd_level));
     ESP_LOGI(TAG, "audio amp SD pin EXIO%d set to %d", EXIO_AUDIO_SD_PIN, sd_level ? 1 : 0);
-}
-
-static void audio_amp_sd_selftest(void)
-{
-    ESP_LOGI(TAG, "audio SD self-test: EXIO%d=0", EXIO_AUDIO_SD_PIN);
-    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_AUDIO_SD_PIN, false));
-    vTaskDelay(pdMS_TO_TICKS(80));
-    beep_once();
-    vTaskDelay(pdMS_TO_TICKS(120));
-
-    ESP_LOGI(TAG, "audio SD self-test: EXIO%d=1", EXIO_AUDIO_SD_PIN);
-    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_AUDIO_SD_PIN, true));
-    vTaskDelay(pdMS_TO_TICKS(80));
-    beep_once();
-    vTaskDelay(pdMS_TO_TICKS(120));
-
-    // Restore configured level after probing both polarities.
-    audio_amp_init_via_exio();
 }
 
 static void lcd_hw_reset_via_exio(void)
@@ -786,6 +942,17 @@ static void beep_once(void)
         ESP_LOGW(TAG, "beep write partial: %u/%u bytes, err=%s, last_written=%u",
                  (unsigned)offset, (unsigned)s_beep_pcm_bytes,
                  esp_err_to_name(last_err), (unsigned)last_written);
+    }
+}
+
+static void beep_for_ms(uint32_t duration_ms)
+{
+    if (duration_ms == 0) {
+        return;
+    }
+    int64_t end_us = esp_timer_get_time() + ((int64_t)duration_ms * 1000);
+    while (esp_timer_get_time() < end_us) {
+        beep_once();
     }
 }
 
@@ -1040,11 +1207,8 @@ void app_main(void)
     audio_amp_init_via_exio();
     beep_init();
     vTaskDelay(pdMS_TO_TICKS(120));
-    audio_amp_sd_selftest();
-    ESP_LOGI(TAG, "audio self-test beep");
-    beep_once();
-    vTaskDelay(pdMS_TO_TICKS(120));
-    beep_once();
+    ESP_LOGI(TAG, "audio boot tone: %d ms", BEEP_BOOT_DURATION_MS);
+    beep_for_ms(BEEP_BOOT_DURATION_MS);
     backlight_init();
     backlight_set_percent(60);
     lcd_init();
@@ -1055,6 +1219,7 @@ void app_main(void)
     }
 
     int64_t last_clock_update_us = 0;
+    int64_t last_ring_update_us = 0;
     while (1) {
         int64_t now_us = esp_timer_get_time();
 
@@ -1077,10 +1242,15 @@ void app_main(void)
                 ti.tm_sec = (int)(uptime_s % 60ULL);
             }
 
-            draw_time(&ti, s_time_synced);
+            draw_time(&ti);
             ESP_LOGI(TAG, "displayed: %02d:%02d:%02d (%s)",
                      ti.tm_hour, ti.tm_min, ti.tm_sec,
                      s_time_synced ? "ntp" : "uptime");
+        }
+
+        if (now_us - last_ring_update_us >= RING_UPDATE_INTERVAL_US) {
+            last_ring_update_us = now_us;
+            ring_animation_tick();
         }
 
         touch_check_and_beep();
