@@ -2,10 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
 
 #include "driver/i2c.h"
-#include "driver/i2s_std.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -63,46 +61,9 @@
 #define EXIO_REG_OUTPUT      0x01
 #define EXIO_REG_CONFIG      0x03
 #define EXIO_OUTPUT_DEFAULT  0x00
-#define EXIO_TOUCH_RST_PIN   1
 #define EXIO_LCD_RST_PIN     2
-#define EXIO_AUDIO_SD_PIN    5
-
-// Official schematic uses NS8002 SD pin on Extend_IO5 (MIC_SD net).
-// In official demo EXIO defaults to 0x00, so keep this default low.
-#ifndef EXIO_AUDIO_SD_ACTIVE_HIGH
-#define EXIO_AUDIO_SD_ACTIVE_HIGH 0
-#endif
-
-#define TOUCH_I2C_ADDR       0x15
-#define TOUCH_INT_PIN        4
-#define TOUCH_REG_DATA       0x01
-#define TOUCH_REG_CHIP_ID    0xA7
-#define TOUCH_REG_SLEEP_CTRL 0xFE
-
-#define SPEAKER_I2S_DOUT     47
-#define SPEAKER_I2S_BCLK     48
-#define SPEAKER_I2S_WS       38
-
-#define BEEP_SAMPLE_RATE_HZ     44100
-#define BEEP_FREQ_HZ            1600
-#define BEEP_DURATION_MS        140
-#define BEEP_AMPLITUDE          24000
-#define BEEP_WRITE_TIMEOUT_MS   600
-#define BEEP_WRITE_CHUNK_BYTES  2048
-#define BEEP_BOOT_DURATION_MS   5000
 
 #define DRAW_CHUNK_ROWS      8
-
-#define RING_TEXT                "LOVE WAGAGA LOVE WAGAGA "
-#define RING_SLOT_COUNT          32
-#define RING_RADIUS              150.0f
-#define RING_FONT_SCALE          2
-#define RING_GLYPH_CANVAS_W      28
-#define RING_GLYPH_CANVAS_H      28
-#define RING_GLYPH_STROKE        2
-#define RING_UPDATE_INTERVAL_US  33333
-#define RING_ROTATE_STEP_RAD     0.00349066f  // 0.2 degrees
-#define PI_F                     3.14159265f
 
 // Some ESP32-S3-Touch-LCD-1.85C batches require this init table.
 static const st77916_lcd_init_cmd_t st77916_init_waveshare_185c[] = {
@@ -304,17 +265,6 @@ static size_t s_draw_buf_pixels = 0;
 static uint64_t s_boot_us = 0;
 static uint8_t s_exio_output_state = 0;
 
-static i2s_chan_handle_t s_i2s_tx_chan = NULL;
-static i2s_chan_handle_t s_i2s_rx_chan = NULL;
-static int16_t *s_beep_pcm = NULL;
-static size_t s_beep_pcm_bytes = 0;
-
-static bool s_touch_pressed_last = false;
-static int64_t s_last_beep_us = 0;
-
-static void beep_once(void);
-static void beep_for_ms(uint32_t duration_ms);
-
 enum {
     SEG_A = 1 << 0,
     SEG_B = 1 << 1,
@@ -464,159 +414,7 @@ static void draw_digit_value(int x, int y, int digit_w, int digit_h, int seg_w, 
     draw_digit_mask(x, y, digit_w, digit_h, seg_w, s_digit_mask[value], color);
 }
 
-static const uint8_t s_font_5x7_space[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t s_font_5x7_A[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
-static const uint8_t s_font_5x7_E[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
-static const uint8_t s_font_5x7_G[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E};
-static const uint8_t s_font_5x7_L[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
-static const uint8_t s_font_5x7_O[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
-static const uint8_t s_font_5x7_V[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04};
-static const uint8_t s_font_5x7_W[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
-static uint16_t s_ring_glyph_canvas[RING_GLYPH_CANVAS_W * RING_GLYPH_CANVAS_H];
-
-static const uint8_t *font_5x7_get_glyph(char c)
-{
-    switch (c) {
-        case 'A':
-            return s_font_5x7_A;
-        case 'E':
-            return s_font_5x7_E;
-        case 'G':
-            return s_font_5x7_G;
-        case 'L':
-            return s_font_5x7_L;
-        case 'O':
-            return s_font_5x7_O;
-        case 'V':
-            return s_font_5x7_V;
-        case 'W':
-            return s_font_5x7_W;
-        case ' ':
-        default:
-            return s_font_5x7_space;
-    }
-}
-
-static void draw_char_5x7_scaled_rotated(int cx, int cy, char c, int scale, float angle_rad, uint16_t fg, uint16_t bg)
-{
-    if (!s_panel) {
-        return;
-    }
-
-    if (scale < 1) {
-        scale = 1;
-    }
-
-    for (size_t i = 0; i < (size_t)RING_GLYPH_CANVAS_W * (size_t)RING_GLYPH_CANVAS_H; i++) {
-        s_ring_glyph_canvas[i] = bg;
-    }
-
-    const uint8_t *glyph = font_5x7_get_glyph(c);
-    const int src_w = 5 * scale;
-    const int src_h = 7 * scale;
-    const float src_cx = ((float)src_w - 1.0f) * 0.5f;
-    const float src_cy = ((float)src_h - 1.0f) * 0.5f;
-    const float dst_cx = ((float)RING_GLYPH_CANVAS_W - 1.0f) * 0.5f;
-    const float dst_cy = ((float)RING_GLYPH_CANVAS_H - 1.0f) * 0.5f;
-    const float cs = cosf(angle_rad);
-    const float sn = sinf(angle_rad);
-
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 5; col++) {
-            if ((bits & (1U << (4 - col))) == 0) {
-                continue;
-            }
-            for (int sy = 0; sy < scale; sy++) {
-                for (int sx = 0; sx < scale; sx++) {
-                    float lx = (float)(col * scale + sx) - src_cx;
-                    float ly = (float)(row * scale + sy) - src_cy;
-                    float rx = lx * cs - ly * sn;
-                    float ry = lx * sn + ly * cs;
-                    int dx = (int)lroundf(rx + dst_cx);
-                    int dy = (int)lroundf(ry + dst_cy);
-                    for (int oy = 0; oy < RING_GLYPH_STROKE; oy++) {
-                        for (int ox = 0; ox < RING_GLYPH_STROKE; ox++) {
-                            int px = dx + ox;
-                            int py = dy + oy;
-                            if (px >= 0 && px < RING_GLYPH_CANVAS_W && py >= 0 && py < RING_GLYPH_CANVAS_H) {
-                                s_ring_glyph_canvas[py * RING_GLYPH_CANVAS_W + px] = fg;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    int x0 = cx - RING_GLYPH_CANVAS_W / 2;
-    int y0 = cy - RING_GLYPH_CANVAS_H / 2;
-    if (x0 < 0 || y0 < 0 || (x0 + RING_GLYPH_CANVAS_W) > LCD_H_RES || (y0 + RING_GLYPH_CANVAS_H) > LCD_V_RES) {
-        return;
-    }
-
-    esp_lcd_panel_draw_bitmap(
-        s_panel,
-        x0,
-        y0,
-        x0 + RING_GLYPH_CANVAS_W,
-        y0 + RING_GLYPH_CANVAS_H,
-        s_ring_glyph_canvas);
-}
-
-static void ring_animation_tick(void)
-{
-    static const char ring_text[] = RING_TEXT;
-    static const int ring_text_len = (int)(sizeof(ring_text) - 1);
-    static bool initialized = false;
-    static float current_angle = 0.0f;
-    const int cx = LCD_H_RES / 2;
-    const int cy = LCD_V_RES / 2;
-    const float angle_step = (2.0f * PI_F) / (float)RING_SLOT_COUNT;
-    const uint16_t bg = rgb565_be(0x00, 0x00, 0x00);
-    const uint16_t ring_color = rgb565_be(0xF7, 0xF3, 0xE8);
-    float previous_angle = current_angle;
-
-    if (!initialized) {
-        for (int i = 0; i < RING_SLOT_COUNT; i++) {
-            char ch = ring_text[i % ring_text_len];
-            float theta = current_angle + (float)i * angle_step;
-            int px = (int)lroundf((float)cx + cosf(theta) * RING_RADIUS);
-            int py = (int)lroundf((float)cy + sinf(theta) * RING_RADIUS);
-            float tangent = theta + (PI_F * 0.5f);
-            draw_char_5x7_scaled_rotated(px, py, ch, RING_FONT_SCALE, tangent, ring_color, bg);
-        }
-        initialized = true;
-        return;
-    }
-
-    previous_angle = current_angle;
-    current_angle += RING_ROTATE_STEP_RAD;
-    if (current_angle >= (2.0f * PI_F)) {
-        current_angle -= (2.0f * PI_F);
-    }
-
-    // Pass 1: clear all old glyph positions.
-    for (int i = 0; i < RING_SLOT_COUNT; i++) {
-        char ch = ring_text[i % ring_text_len];
-
-        float old_theta = previous_angle + (float)i * angle_step;
-        int old_px = (int)lroundf((float)cx + cosf(old_theta) * RING_RADIUS);
-        int old_py = (int)lroundf((float)cy + sinf(old_theta) * RING_RADIUS);
-        float old_tangent = old_theta + (PI_F * 0.5f);
-        draw_char_5x7_scaled_rotated(old_px, old_py, ch, RING_FONT_SCALE, old_tangent, bg, bg);
-    }
-
-    // Pass 2: draw all new glyph positions.
-    for (int i = 0; i < RING_SLOT_COUNT; i++) {
-        char ch = ring_text[i % ring_text_len];
-        float new_theta = current_angle + (float)i * angle_step;
-        int new_px = (int)lroundf((float)cx + cosf(new_theta) * RING_RADIUS);
-        int new_py = (int)lroundf((float)cy + sinf(new_theta) * RING_RADIUS);
-        float new_tangent = new_theta + (PI_F * 0.5f);
-        draw_char_5x7_scaled_rotated(new_px, new_py, ch, RING_FONT_SCALE, new_tangent, ring_color, bg);
-    }
-}
+// Ring text animation removed: keep clock-only UI.
 
 static void draw_time(const struct tm *ti)
 {
@@ -708,11 +506,6 @@ static esp_err_t i2c_write_u8(uint8_t dev_addr, uint8_t reg, uint8_t val)
     return i2c_master_write_to_device(EXIO_I2C_PORT, dev_addr, payload, sizeof(payload), pdMS_TO_TICKS(100));
 }
 
-static esp_err_t i2c_read_bytes(uint8_t dev_addr, uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_write_read_device(EXIO_I2C_PORT, dev_addr, &reg, 1, data, len, pdMS_TO_TICKS(100));
-}
-
 static esp_err_t exio_write_reg(uint8_t reg, uint8_t val)
 {
     return i2c_write_u8(EXIO_ADDR, reg, val);
@@ -761,214 +554,12 @@ static void exio_init(void)
     ESP_LOGI(TAG, "EXIO output default: 0x%02x", s_exio_output_state);
 }
 
-static void audio_amp_init_via_exio(void)
-{
-    bool sd_level = EXIO_AUDIO_SD_ACTIVE_HIGH ? true : false;
-    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_AUDIO_SD_PIN, sd_level));
-    ESP_LOGI(TAG, "audio amp SD pin EXIO%d set to %d", EXIO_AUDIO_SD_PIN, sd_level ? 1 : 0);
-}
-
 static void lcd_hw_reset_via_exio(void)
 {
     ESP_ERROR_CHECK(exio_set_pin_level(EXIO_LCD_RST_PIN, false));
     vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(exio_set_pin_level(EXIO_LCD_RST_PIN, true));
     vTaskDelay(pdMS_TO_TICKS(120));
-}
-
-static void touch_hw_reset_via_exio(void)
-{
-    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_TOUCH_RST_PIN, false));
-    vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_TOUCH_RST_PIN, true));
-    vTaskDelay(pdMS_TO_TICKS(50));
-}
-
-static void touch_init(void)
-{
-    touch_hw_reset_via_exio();
-
-    gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << TOUCH_INT_PIN,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_conf));
-
-    uint8_t chip_id = 0;
-    if (i2c_read_bytes(TOUCH_I2C_ADDR, TOUCH_REG_CHIP_ID, &chip_id, 1) == ESP_OK) {
-        ESP_LOGI(TAG, "CST816 chip id: 0x%02x", chip_id);
-    } else {
-        ESP_LOGW(TAG, "CST816 chip id read failed");
-    }
-
-    // Same setting used in known working example to keep touch awake.
-    if (i2c_write_u8(TOUCH_I2C_ADDR, TOUCH_REG_SLEEP_CTRL, 10) != ESP_OK) {
-        ESP_LOGW(TAG, "CST816 sleep config write failed");
-    }
-}
-
-static bool touch_read_pressed(uint16_t *x, uint16_t *y)
-{
-    uint8_t buf[6] = {0};
-    if (i2c_read_bytes(TOUCH_I2C_ADDR, TOUCH_REG_DATA, buf, sizeof(buf)) != ESP_OK) {
-        return false;
-    }
-
-    uint8_t points = (uint8_t)(buf[1] & 0x0F);
-    if (points == 0) {
-        return false;
-    }
-
-    if (x) {
-        *x = (uint16_t)(((buf[2] & 0x0F) << 8) | buf[3]);
-    }
-    if (y) {
-        *y = (uint16_t)(((buf[4] & 0x0F) << 8) | buf[5]);
-    }
-    return true;
-}
-
-static void beep_init(void)
-{
-    size_t beep_samples = (BEEP_SAMPLE_RATE_HZ * BEEP_DURATION_MS) / 1000;
-    if (beep_samples == 0) {
-        beep_samples = 1;
-    }
-
-    s_beep_pcm_bytes = beep_samples * 2 * sizeof(int16_t);  // stereo 16-bit
-    s_beep_pcm = heap_caps_malloc(s_beep_pcm_bytes, MALLOC_CAP_INTERNAL);
-    if (!s_beep_pcm) {
-        s_beep_pcm = heap_caps_malloc(s_beep_pcm_bytes, MALLOC_CAP_DEFAULT);
-    }
-    if (!s_beep_pcm) {
-        ESP_LOGW(TAG, "beep pcm alloc failed");
-        return;
-    }
-
-    int period = BEEP_SAMPLE_RATE_HZ / BEEP_FREQ_HZ;
-    if (period < 2) {
-        period = 2;
-    }
-
-    for (size_t i = 0; i < beep_samples; i++) {
-        int16_t sample = ((i % (size_t)period) < (size_t)(period / 2)) ? BEEP_AMPLITUDE : (int16_t)-BEEP_AMPLITUDE;
-        s_beep_pcm[i * 2] = sample;
-        s_beep_pcm[i * 2 + 1] = sample;
-    }
-
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-
-    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, &s_i2s_rx_chan);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BEEP_SAMPLE_RATE_HZ),
-        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = SPEAKER_I2S_BCLK,
-            .ws = SPEAKER_I2S_WS,
-            .dout = SPEAKER_I2S_DOUT,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
-
-    err = i2s_channel_init_std_mode(s_i2s_tx_chan, &std_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    err = i2s_channel_enable(s_i2s_tx_chan);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGI(TAG, "beep i2s ready: %d Hz, PHILIPS, bclk=%d ws=%d dout=%d",
-             BEEP_SAMPLE_RATE_HZ, SPEAKER_I2S_BCLK, SPEAKER_I2S_WS, SPEAKER_I2S_DOUT);
-}
-
-static void beep_once(void)
-{
-    if (!s_i2s_tx_chan || !s_beep_pcm || s_beep_pcm_bytes == 0) {
-        return;
-    }
-
-    size_t offset = 0;
-    esp_err_t last_err = ESP_OK;
-    size_t last_written = 0;
-    while (offset < s_beep_pcm_bytes) {
-        size_t remain = s_beep_pcm_bytes - offset;
-        size_t chunk = (remain > BEEP_WRITE_CHUNK_BYTES) ? BEEP_WRITE_CHUNK_BYTES : remain;
-        size_t written = 0;
-        esp_err_t err = i2s_channel_write(
-            s_i2s_tx_chan,
-            ((const uint8_t *)s_beep_pcm) + offset,
-            chunk,
-            &written,
-            pdMS_TO_TICKS(BEEP_WRITE_TIMEOUT_MS));
-
-        // If timeout happens after partial DMA copy, keep moving forward.
-        if (written > 0) {
-            offset += written;
-        }
-
-        if (err != ESP_OK && written == 0) {
-            last_err = err;
-            last_written = written;
-            break;
-        }
-
-        if (err != ESP_OK) {
-            last_err = err;
-            last_written = written;
-        }
-    }
-
-    if (offset != s_beep_pcm_bytes) {
-        ESP_LOGW(TAG, "beep write partial: %u/%u bytes, err=%s, last_written=%u",
-                 (unsigned)offset, (unsigned)s_beep_pcm_bytes,
-                 esp_err_to_name(last_err), (unsigned)last_written);
-    }
-}
-
-static void beep_for_ms(uint32_t duration_ms)
-{
-    if (duration_ms == 0) {
-        return;
-    }
-    int64_t end_us = esp_timer_get_time() + ((int64_t)duration_ms * 1000);
-    while (esp_timer_get_time() < end_us) {
-        beep_once();
-    }
-}
-
-static void touch_check_and_beep(void)
-{
-    uint16_t x = 0;
-    uint16_t y = 0;
-    bool pressed = touch_read_pressed(&x, &y);
-    int64_t now_us = esp_timer_get_time();
-
-    if (pressed && !s_touch_pressed_last && (now_us - s_last_beep_us) > 120000) {
-        s_last_beep_us = now_us;
-        ESP_LOGI(TAG, "touch press: x=%u y=%u", x, y);
-        beep_once();
-    }
-    s_touch_pressed_last = pressed;
 }
 
 static void backlight_init(void)
@@ -1203,15 +794,11 @@ void app_main(void)
     nvs_init();
     exio_init();
     lcd_hw_reset_via_exio();
-    touch_init();
-    audio_amp_init_via_exio();
-    beep_init();
-    vTaskDelay(pdMS_TO_TICKS(120));
-    ESP_LOGI(TAG, "audio boot tone: %d ms", BEEP_BOOT_DURATION_MS);
-    beep_for_ms(BEEP_BOOT_DURATION_MS);
     backlight_init();
     backlight_set_percent(60);
     lcd_init();
+    struct tm startup_ti = {0};
+    draw_time(&startup_ti);
 
     s_time_synced = false;
     if (wifi_connect_blocking()) {
@@ -1219,7 +806,6 @@ void app_main(void)
     }
 
     int64_t last_clock_update_us = 0;
-    int64_t last_ring_update_us = 0;
     while (1) {
         int64_t now_us = esp_timer_get_time();
 
@@ -1248,12 +834,6 @@ void app_main(void)
                      s_time_synced ? "ntp" : "uptime");
         }
 
-        if (now_us - last_ring_update_us >= RING_UPDATE_INTERVAL_US) {
-            last_ring_update_us = now_us;
-            ring_animation_tick();
-        }
-
-        touch_check_and_beep();
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
