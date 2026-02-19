@@ -4,6 +4,7 @@
 #include <time.h>
 
 #include "driver/i2c.h"
+#include "driver/i2s_std.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -62,6 +63,15 @@
 #define EXIO_REG_CONFIG      0x03
 #define EXIO_OUTPUT_DEFAULT  0x00
 #define EXIO_LCD_RST_PIN     2
+#define EXIO_AUDIO_SD_PIN    5
+
+#define SPEAKER_I2S_DOUT     47
+#define SPEAKER_I2S_BCLK     48
+#define SPEAKER_I2S_WS       38
+#define BEEP_SAMPLE_RATE_HZ  22050
+#define BEEP_AMPLITUDE       12000
+#define BEEP_WRITE_TIMEOUT_MS 200
+#define BEEP_WRITE_CHUNK_BYTES 2048
 
 #define DRAW_CHUNK_ROWS      8
 
@@ -264,6 +274,10 @@ static uint16_t *s_draw_buf = NULL;
 static size_t s_draw_buf_pixels = 0;
 static uint64_t s_boot_us = 0;
 static uint8_t s_exio_output_state = 0;
+static i2s_chan_handle_t s_i2s_tx_chan = NULL;
+static i2s_chan_handle_t s_i2s_rx_chan = NULL;
+static int16_t *s_beep_pcm = NULL;
+static size_t s_beep_pcm_bytes = 0;
 
 enum {
     SEG_A = 1 << 0,
@@ -562,6 +576,159 @@ static void lcd_hw_reset_via_exio(void)
     vTaskDelay(pdMS_TO_TICKS(120));
 }
 
+static void audio_amp_set(bool enabled)
+{
+    ESP_ERROR_CHECK(exio_set_pin_level(EXIO_AUDIO_SD_PIN, enabled));
+    ESP_LOGI(TAG, "audio amp SD pin EXIO%d set to %d", EXIO_AUDIO_SD_PIN, enabled ? 1 : 0);
+}
+
+static bool beep_init_i2s(void)
+{
+    if (s_i2s_tx_chan) {
+        return true;
+    }
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, &s_i2s_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BEEP_SAMPLE_RATE_HZ),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SPEAKER_I2S_BCLK,
+            .ws = SPEAKER_I2S_WS,
+            .dout = SPEAKER_I2S_DOUT,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    err = i2s_channel_init_std_mode(s_i2s_tx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = i2s_channel_enable(s_i2s_tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "beep i2s ready: %d Hz, PHILIPS, bclk=%d ws=%d dout=%d",
+             BEEP_SAMPLE_RATE_HZ, SPEAKER_I2S_BCLK, SPEAKER_I2S_WS, SPEAKER_I2S_DOUT);
+    return true;
+}
+
+static bool beep_build_tone(uint32_t freq_hz, uint32_t duration_ms)
+{
+    size_t samples = (BEEP_SAMPLE_RATE_HZ * (size_t)duration_ms) / 1000U;
+    if (samples == 0) {
+        samples = 1;
+    }
+
+    size_t bytes = samples * 2U * sizeof(int16_t);  // stereo 16-bit
+    if (bytes != s_beep_pcm_bytes || s_beep_pcm == NULL) {
+        if (s_beep_pcm) {
+            free(s_beep_pcm);
+            s_beep_pcm = NULL;
+            s_beep_pcm_bytes = 0;
+        }
+        s_beep_pcm = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
+        if (!s_beep_pcm) {
+            s_beep_pcm = heap_caps_malloc(bytes, MALLOC_CAP_DEFAULT);
+        }
+        if (!s_beep_pcm) {
+            ESP_LOGW(TAG, "beep pcm alloc failed: %u bytes", (unsigned)bytes);
+            return false;
+        }
+        s_beep_pcm_bytes = bytes;
+    }
+
+    uint32_t period = (freq_hz > 0) ? (BEEP_SAMPLE_RATE_HZ / freq_hz) : 0;
+    if (period < 2) {
+        period = 2;
+    }
+
+    for (size_t i = 0; i < samples; i++) {
+        int16_t sample = ((i % period) < (period / 2U)) ? BEEP_AMPLITUDE : (int16_t)-BEEP_AMPLITUDE;
+        s_beep_pcm[i * 2] = sample;
+        s_beep_pcm[i * 2 + 1] = sample;
+    }
+    return true;
+}
+
+static void beep_play_once(void)
+{
+    if (!s_i2s_tx_chan || !s_beep_pcm || s_beep_pcm_bytes == 0) {
+        return;
+    }
+
+    size_t offset = 0;
+    esp_err_t last_err = ESP_OK;
+    while (offset < s_beep_pcm_bytes) {
+        size_t remain = s_beep_pcm_bytes - offset;
+        size_t chunk = (remain > BEEP_WRITE_CHUNK_BYTES) ? BEEP_WRITE_CHUNK_BYTES : remain;
+        size_t written = 0;
+
+        esp_err_t err = i2s_channel_write(
+            s_i2s_tx_chan,
+            ((const uint8_t *)s_beep_pcm) + offset,
+            chunk,
+            &written,
+            pdMS_TO_TICKS(BEEP_WRITE_TIMEOUT_MS));
+
+        if (written > 0) {
+            offset += written;
+        }
+        if (err != ESP_OK && written == 0) {
+            last_err = err;
+            break;
+        }
+        if (err != ESP_OK) {
+            last_err = err;
+        }
+    }
+
+    if (offset != s_beep_pcm_bytes) {
+        ESP_LOGW(TAG, "beep write partial: %u/%u bytes, err=%s",
+                 (unsigned)offset, (unsigned)s_beep_pcm_bytes, esp_err_to_name(last_err));
+    }
+}
+
+static void audio_boot_self_test(void)
+{
+    if (!beep_init_i2s()) {
+        ESP_LOGW(TAG, "skip audio self-test because I2S init failed");
+        return;
+    }
+
+    const bool amp_levels[] = {true, false};
+    const uint32_t freqs[] = {1040, 784};
+    for (size_t i = 0; i < 2; i++) {
+        audio_amp_set(amp_levels[i]);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        if (!beep_build_tone(freqs[i], 220)) {
+            return;
+        }
+        ESP_LOGI(TAG, "audio self-test tone %u/2: amp_sd=%d freq=%u",
+                 (unsigned)(i + 1), amp_levels[i] ? 1 : 0, (unsigned)freqs[i]);
+        beep_play_once();
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+}
+
 static void backlight_init(void)
 {
     ledc_timer_config_t timer_cfg = {
@@ -793,6 +960,7 @@ void app_main(void)
 
     nvs_init();
     exio_init();
+    audio_boot_self_test();
     lcd_hw_reset_via_exio();
     backlight_init();
     backlight_set_percent(60);
